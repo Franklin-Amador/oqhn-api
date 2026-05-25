@@ -115,7 +115,6 @@ async def predict_live(location_id: int):
     now = datetime.now(timezone.utc)
     sensor_input = SensorInput(
         pm25=             readings.get("pm25", 0.0),
-        pm10=             readings.get("pm10", 0.0),
         pm1=              readings.get("pm1",  0.0),
         temperature=      readings.get("temperature", 25.0),
         relativehumidity= readings.get("relativehumidity", 60.0),
@@ -158,7 +157,6 @@ async def stations_geojson(refresh: bool = False):
 def _build_sensor_input(readings: dict, now) -> SensorInput:
     return SensorInput(
         pm25=             readings.get("pm25", 0.0),
-        pm10=             readings.get("pm10", 0.0),
         pm1=              readings.get("pm1",  0.0),
         temperature=      readings.get("temperature", 25.0),
         relativehumidity= readings.get("relativehumidity", 60.0),

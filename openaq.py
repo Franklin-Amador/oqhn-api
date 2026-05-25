@@ -11,8 +11,9 @@ from config import settings
 # Parámetros disponibles en Honduras (OpenAQ v3 - Sustenta Honduras)
 PARAM_NAMES = ["pm25", "pm10", "pm1", "temperature", "relativehumidity", "um003"]
 
-_LAG_COLS  = ["pm25", "pm10", "pm1"]
+_LAG_COLS  = ["pm25", "pm1"]   # pm10 excluido — 100% NaN en Sustenta Honduras
 _LAG_STEPS = [1, 2, 3, 6, 12, 24]
+_DIFF_COLS = ["pm25", "pm1"]   # rate of change 1h
 
 
 # ── Rate-limiter de token-bucket ─────────────────────────────────────────────
@@ -241,7 +242,17 @@ def _series_to_features(series_map: dict[str, pd.Series]) -> dict:
         for lag in _LAG_STEPS:
             result[f"{col}_lag{lag}h"] = float(s.iloc[-lag - 1]) if len(s) > lag else 0.0
 
-    for col in ["pm25", "pm10"]:
+    # Diff features: rate of change 1h (current - lag1h)
+    for col in _DIFF_COLS:
+        if col not in df.columns:
+            continue
+        s = df[col]
+        current = float(s.iloc[-1])
+        lag1    = float(s.iloc[-2]) if len(s) > 1 else current
+        result[f"{col}_diff1h"] = round(current - lag1, 4)
+
+    # Rolling features (pm25 y pm1; pm10 excluido)
+    for col in ["pm25", "pm1"]:
         if col not in df.columns:
             continue
         s = df[col]
@@ -292,10 +303,12 @@ async def fetch_readings_for_sensor_map(sensor_map: dict[str, int]) -> dict:
         for col in _LAG_COLS:
             for lag in _LAG_STEPS:
                 result[f"{col}_lag{lag}h"] = 0.0
+        for col in _DIFF_COLS:
+            result[f"{col}_diff1h"] = 0.0
         result["pm25_roll4h_mean"]  = pm25_val
         result["pm25_roll24h_mean"] = pm25_val
-        result["pm10_roll4h_mean"]  = 0.0
-        result["pm10_roll24h_mean"] = 0.0
+        result["pm1_roll4h_mean"]   = 0.0
+        result["pm1_roll24h_mean"]  = 0.0
         return result
 
     # ── 2. pm25 tiene datos → fetch del resto de sensores ────────────────────
