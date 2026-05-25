@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -10,6 +11,7 @@ import onnxruntime as rt
 from config import settings
 
 logger = logging.getLogger(__name__)
+_load_lock = asyncio.Lock()
 
 # AQI display helpers
 AQI_COLORS = {
@@ -40,31 +42,36 @@ class ModelSession:
         self._classes: Optional[list[str]] = None
 
     async def load(self) -> None:
-        """Descarga modelo y metadata desde Vercel Blob al arrancar."""
-        logger.info("Descargando modelo ONNX desde Vercel Blob...")
-        async with httpx.AsyncClient(timeout=60) as client:
-            model_resp = await client.get(settings.model_url)
-            model_resp.raise_for_status()
+        """Descarga modelo y metadata desde Vercel Blob (lazy — solo si no está cargado)."""
+        if self._session is not None:
+            return
+        async with _load_lock:
+            if self._session is not None:
+                return
+            logger.info("Descargando modelo ONNX desde Vercel Blob...")
+            async with httpx.AsyncClient(timeout=60) as client:
+                model_resp = await client.get(settings.model_url)
+                model_resp.raise_for_status()
 
-            meta_resp = await client.get(settings.metadata_url)
-            meta_resp.raise_for_status()
+                meta_resp = await client.get(settings.metadata_url)
+                meta_resp.raise_for_status()
 
-        self._metadata = json.loads(meta_resp.content)
-        self._classes  = self._metadata["classes"]
+            self._metadata = json.loads(meta_resp.content)
+            self._classes  = self._metadata["classes"]
 
-        model_bytes = model_resp.content
-        self._session = rt.InferenceSession(
-            model_bytes,
-            providers=["CPUExecutionProvider"]
-        )
-        self._input_name  = self._session.get_inputs()[0].name
-        self._output_names = [o.name for o in self._session.get_outputs()]
+            model_bytes = model_resp.content
+            self._session = rt.InferenceSession(
+                model_bytes,
+                providers=["CPUExecutionProvider"]
+            )
+            self._input_name  = self._session.get_inputs()[0].name
+            self._output_names = [o.name for o in self._session.get_outputs()]
 
-        logger.info(
-            "Modelo cargado. Clases: %s | Features: %d",
-            self._classes,
-            len(self._metadata["features"])
-        )
+            logger.info(
+                "Modelo cargado. Clases: %s | Features: %d",
+                self._classes,
+                len(self._metadata["features"])
+            )
 
     def predict(self, features: list[float]) -> dict:
         """

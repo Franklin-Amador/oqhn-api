@@ -22,10 +22,9 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # startup: cargar modelo desde Vercel Blob
-    await model_session.load()
+    # Lazy load: el modelo se descarga en el primer request que lo necesite.
+    # Esto evita el timeout de startup en Vercel serverless (10s limit).
     yield
-    # shutdown: nada que limpiar (onnxruntime no necesita cierre explícito)
 
 
 app = FastAPI(
@@ -40,7 +39,11 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # limitar al dominio de Vercel en producción
+    allow_origins=[
+        "https://oqhn-frontend.vercel.app",
+        "http://127.0.0.1:4321",   # dev local
+        "http://localhost:4321",
+    ],
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
@@ -87,6 +90,7 @@ async def predict(body: SensorInput):
     Predice categoría AQI a partir de lecturas de sensores enviadas manualmente.
     El preprocessing (imputer + scaler) está embebido en el pipeline ONNX.
     """
+    await model_session.load()
     if not model_session.is_loaded:
         raise HTTPException(503, "Modelo aún cargando")
 
@@ -102,6 +106,7 @@ async def predict_live(location_id: int):
     """
     Obtiene lecturas actuales de una estación OpenAQ y predice su categoría AQI.
     """
+    await model_session.load()
     if not model_session.is_loaded:
         raise HTTPException(503, "Modelo aún cargando")
 
@@ -169,10 +174,11 @@ def _build_sensor_input(readings: dict, now) -> SensorInput:
 @app.get("/stations/predictions", tags=["Stations"])
 async def stations_predictions(refresh: bool = False):
     """
-    Predicciones live para todas las estaciones HN. Cacheado 10 min.
-    Primer hit (cache miss): ~2-3 min. Siguientes hits: instantáneos.
+    Predicciones live para todas las estaciones HN. Cacheado 6h.
+    Primer hit (cache miss): ~4 min. Siguientes hits: instantáneos.
     `?refresh=true` fuerza refetch.
     """
+    await model_session.load()
     if not model_session.is_loaded:
         raise HTTPException(503, "Modelo aún cargando")
     return await get_all_predictions(model_session, _build_sensor_input,
@@ -184,6 +190,7 @@ async def stations_predictions(refresh: bool = False):
 @app.post("/predict/batch", response_model=list[PredictionResult], tags=["Prediction"])
 async def predict_batch(body: list[SensorInput]):
     """Predice múltiples lecturas en una sola llamada (máx. 100)."""
+    await model_session.load()
     if not model_session.is_loaded:
         raise HTTPException(503, "Modelo aún cargando")
     if len(body) > 100:
