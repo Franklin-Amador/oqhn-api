@@ -22,7 +22,7 @@ _LAG_STEPS = [1, 2, 3, 6, 12, 24]
 #
 # 4 req/seg es conservador para el plan con API-key de OpenAQ (60 req/min = 1/seg
 # sin key, ≥10/seg con key). Ajustar OPENAQ_RATE_PER_SEC si tienes plan superior.
-_OPENAQ_RATE_PER_SEC: float = 1  # 1 req/s — conservador, sin 429
+_OPENAQ_RATE_PER_SEC: float = 2  # 2 req/s — con API key OpenAQ free tier aguanta ~120 req/min
 
 
 class _TokenBucket:

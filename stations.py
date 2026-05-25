@@ -16,6 +16,7 @@ from config import settings
 from openaq import (
     PARAM_NAMES,
     _headers,
+    _get,
     fetch_location_data,
     fetch_readings_for_sensor_map,
 )
@@ -31,13 +32,17 @@ _PREDICTIONS_CACHE: dict  = {"ts": 0.0, "data": None}
 _STATIONS_TTL_SEC    = 60 * 60   # 1h — el catálogo de estaciones rara vez cambia
 _PREDICTIONS_TTL_SEC = 6 * 60 * 60  # 6 h — el frontend polling también es cada 6h
 
+# Lock para evitar stampede: si el batch ya está corriendo, los requests
+# siguientes esperan el resultado en vez de arrancar un segundo batch paralelo.
+_PREDICTIONS_LOCK = asyncio.Lock()
+
 
 async def _fetch_honduras_locations(limit: int = 100) -> list[dict]:
     """Trae el catálogo de estaciones de Honduras desde OpenAQ."""
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(
+        resp = await _get(
+            client,
             f"{settings.openaq_api_url}/locations",
-            headers=_headers(),
             params={"countries_id": HN_COUNTRY_ID, "limit": limit},
         )
         resp.raise_for_status()
@@ -136,6 +141,8 @@ async def _safe_predict_one(
         readings = await fetch_readings_for_sensor_map(sensor_map)
 
         if not readings:
+            logger.debug("location %d (%s): sin datos", location_id,
+                         (loc_info or {}).get("name", "?"))
             return {
                 "location_id": location_id,
                 "has_data":    False,
@@ -180,6 +187,10 @@ async def get_all_predictions(model_session, build_sensor_input,
     Primer hit: lento (~3-6 min — 56 estaciones × ~7 API calls c/u).
     Hits siguientes dentro del TTL: instantáneos.
 
+    El lock _PREDICTIONS_LOCK evita que requests concurrentes (stampede) arranquen
+    batches paralelos: el segundo request espera a que el primero termine y devuelve
+    el caché recién llenado.
+
     Estaciones sin datos recientes vienen con has_data=False.
     """
     now = time.time()
@@ -193,48 +204,70 @@ async def get_all_predictions(model_session, build_sensor_input,
         cached["cache_age_s"] = round(now - _PREDICTIONS_CACHE["ts"], 1)
         return cached
 
-    geojson = await get_stations_geojson()
+    async with _PREDICTIONS_LOCK:
+        # Re-check dentro del lock: otro request pudo haber llenado el caché
+        # mientras esperábamos adquirirlo — si es así, lo devolvemos sin correr batch.
+        now = time.time()
+        if (
+            not force_refresh
+            and _PREDICTIONS_CACHE["data"] is not None
+            and (now - _PREDICTIONS_CACHE["ts"]) < _PREDICTIONS_TTL_SEC
+        ):
+            cached = dict(_PREDICTIONS_CACHE["data"])
+            cached["cache_hit"]   = True
+            cached["cache_age_s"] = round(now - _PREDICTIONS_CACHE["ts"], 1)
+            return cached
 
-    # Pasamos sensor_ids y loc_info directamente desde el caché de estaciones
-    # → elimina 56 llamadas a /locations/{id} por ciclo de predicciones.
-    station_metas = [
-        {
-            "location_id": f["properties"]["id"],
-            "sensor_ids":  f["properties"].get("sensor_ids", {}),
-            "loc_info": {
-                "name":      f["properties"]["name"],
-                "latitude":  f["geometry"]["coordinates"][1],
-                "longitude": f["geometry"]["coordinates"][0],
-            },
+        geojson = await get_stations_geojson()
+
+        # Pasamos sensor_ids y loc_info directamente desde el caché de estaciones
+        # → elimina 56 llamadas a /locations/{id} por ciclo de predicciones.
+        station_metas = [
+            {
+                "location_id": f["properties"]["id"],
+                "sensor_ids":  f["properties"].get("sensor_ids", {}),
+                "loc_info": {
+                    "name":      f["properties"]["name"],
+                    "latitude":  f["geometry"]["coordinates"][1],
+                    "longitude": f["geometry"]["coordinates"][0],
+                },
+            }
+            for f in geojson["features"]
+            if f["properties"].get("has_pm25")
+        ]
+
+        # El rate-limit real está en el token-bucket de openaq.py (_bucket).
+        # El semáforo aquí solo evita abrir demasiados contextos asyncio a la vez.
+        sem = asyncio.Semaphore(20)
+
+        async def _bounded(meta: dict):
+            async with sem:
+                return await _safe_predict_one(
+                    model_session, build_sensor_input,
+                    meta["location_id"],
+                    sensor_map=meta["sensor_ids"],
+                    loc_info=meta["loc_info"],
+                )
+
+        results = await asyncio.gather(*[_bounded(m) for m in station_metas])
+
+        with_data  = sum(1 for r in results if r.get("has_data"))
+        stale_cnt  = sum(1 for r in results if r.get("stale"))
+        error_cnt  = sum(1 for r in results if not r.get("has_data"))
+        logger.info(
+            "Batch predicciones: %d/%d con datos (%d stale), %d sin datos",
+            with_data, len(results), stale_cnt, error_cnt,
+        )
+
+        payload = {
+            "fetched_at":    datetime.now(timezone.utc).isoformat(),
+            "station_count": len(results),
+            "with_data":     with_data,
+            "ttl_seconds":   _PREDICTIONS_TTL_SEC,
+            "cache_hit":     False,
+            "cache_age_s":   0.0,
+            "predictions":   results,
         }
-        for f in geojson["features"]
-        if f["properties"].get("has_pm25")
-    ]
-
-    # El rate-limit real está en el token-bucket de openaq.py (_bucket).
-    # El semáforo aquí solo evita abrir demasiados contextos asyncio a la vez.
-    sem = asyncio.Semaphore(20)
-
-    async def _bounded(meta: dict):
-        async with sem:
-            return await _safe_predict_one(
-                model_session, build_sensor_input,
-                meta["location_id"],
-                sensor_map=meta["sensor_ids"],
-                loc_info=meta["loc_info"],
-            )
-
-    results = await asyncio.gather(*[_bounded(m) for m in station_metas])
-
-    payload = {
-        "fetched_at":    datetime.now(timezone.utc).isoformat(),
-        "station_count": len(location_ids),
-        "with_data":     sum(1 for r in results if r.get("has_data")),
-        "ttl_seconds":   _PREDICTIONS_TTL_SEC,
-        "cache_hit":     False,
-        "cache_age_s":   0.0,
-        "predictions":   results,
-    }
-    _PREDICTIONS_CACHE["data"] = payload
-    _PREDICTIONS_CACHE["ts"]   = now
-    return payload
+        _PREDICTIONS_CACHE["data"] = payload
+        _PREDICTIONS_CACHE["ts"]   = now
+        return payload
