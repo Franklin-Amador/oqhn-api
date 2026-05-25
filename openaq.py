@@ -22,7 +22,7 @@ _LAG_STEPS = [1, 2, 3, 6, 12, 24]
 #
 # 4 req/seg es conservador para el plan con API-key de OpenAQ (60 req/min = 1/seg
 # sin key, ≥10/seg con key). Ajustar OPENAQ_RATE_PER_SEC si tienes plan superior.
-_OPENAQ_RATE_PER_SEC: float = 5
+_OPENAQ_RATE_PER_SEC: float = 1  # 1 req/s — conservador, sin 429
 
 
 class _TokenBucket:
@@ -254,16 +254,60 @@ def _series_to_features(series_map: dict[str, pd.Series]) -> dict:
 
 async def fetch_readings_for_sensor_map(sensor_map: dict[str, int]) -> dict:
     """
-    Intenta obtener ~25h de datos para la estación.
-    Fallback: última lectura de pm25 disponible (≤7 días) con lags en 0 → _stale=True.
-    Devuelve {} si no hay absolutamente nada.
+    Obtiene datos de la estación intentando 3 estrategias en orden:
+
+    1. pm25-first check (1 req): si pm25 no tiene datos en 25h → saltar a stale.
+       Evita hacer 5-10 llamadas extra por sensor para estaciones sin datos.
+    2. Fetch completo: si pm25 tiene datos, traer el resto de sensores.
+    3. Stale fallback: última lectura pm25 disponible (≤7 días), lags=0.
+
+    Total de llamadas por estación:
+      - Con datos recientes : ~6 (1 check + 5 sensores restantes)
+      - Sin datos recientes : ~2 (1 check /hours vacío + 1 stale /measurements)
     """
     if not sensor_map:
         return {}
 
-    # ── Intento normal: ventana 25h ───────────────────────────────────────────
-    series_map: dict[str, pd.Series] = {}
+    pm25_id = sensor_map.get("pm25")
+    if pm25_id is None:
+        return {}  # sin pm25 no podemos predecir
+
+    # ── 1. Check rápido de pm25 ───────────────────────────────────────────────
+    pm25_raw = await _fetch_sensor_hours(pm25_id, hours_back=25)
+
+    if not pm25_raw:
+        # pm25 sin datos recientes → toda la estación está sin datos.
+        # Saltar directo al fallback stale (ahorra 5-10 llamadas a OpenAQ).
+        snap = await _fetch_pm25_latest(pm25_id)
+        if snap is None:
+            return {}
+
+        pm25_val = snap["value"]
+        result: dict = {p: 0.0 for p in PARAM_NAMES}
+        result["pm25"]              = pm25_val
+        result["_latest_timestamp"] = None
+        result["_rows_fetched"]     = 0
+        result["_stale"]            = True
+        result["_stale_age_h"]      = round(snap["age_h"], 1)
+        for col in _LAG_COLS:
+            for lag in _LAG_STEPS:
+                result[f"{col}_lag{lag}h"] = 0.0
+        result["pm25_roll4h_mean"]  = pm25_val
+        result["pm25_roll24h_mean"] = pm25_val
+        result["pm10_roll4h_mean"]  = 0.0
+        result["pm10_roll24h_mean"] = 0.0
+        return result
+
+    # ── 2. pm25 tiene datos → fetch del resto de sensores ────────────────────
+    pm25_records = {
+        e["period"]["datetimeFrom"]["utc"]: e.get("value", float("nan"))
+        for e in pm25_raw if "period" in e
+    }
+    series_map: dict[str, pd.Series] = {"pm25": pd.Series(pm25_records, dtype=float)}
+
     for param, sensor_id in sensor_map.items():
+        if param == "pm25":
+            continue  # ya lo tenemos
         raw = await _fetch_sensor_hours(sensor_id, hours_back=25)
         if raw:
             records = {
@@ -273,34 +317,7 @@ async def fetch_readings_for_sensor_map(sensor_map: dict[str, int]) -> dict:
             if records:
                 series_map[param] = pd.Series(records, dtype=float)
 
-    if series_map:
-        return _series_to_features(series_map)
-
-    # ── Fallback stale: solo pm25 (1 sola llamada adicional) ─────────────────
-    pm25_id = sensor_map.get("pm25")
-    if pm25_id is None:
-        return {}
-
-    snap = await _fetch_pm25_latest(pm25_id)
-    if snap is None:
-        return {}
-
-    pm25_val = snap["value"]
-    result: dict = {p: 0.0 for p in PARAM_NAMES}
-    result["pm25"]               = pm25_val
-    result["_latest_timestamp"]  = None
-    result["_rows_fetched"]      = 0
-    result["_stale"]             = True
-    result["_stale_age_h"]       = round(snap["age_h"], 1)
-
-    for col in _LAG_COLS:
-        for lag in _LAG_STEPS:
-            result[f"{col}_lag{lag}h"] = 0.0
-    result["pm25_roll4h_mean"]  = pm25_val
-    result["pm25_roll24h_mean"] = pm25_val
-    result["pm10_roll4h_mean"]  = 0.0
-    result["pm10_roll24h_mean"] = 0.0
-    return result
+    return _series_to_features(series_map)
 
 
 async def fetch_latest_readings_with_lags(location_id: int) -> dict:

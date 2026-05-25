@@ -29,7 +29,7 @@ HN_COUNTRY_ID = 136
 _STATIONS_CACHE: dict     = {"ts": 0.0, "data": None}
 _PREDICTIONS_CACHE: dict  = {"ts": 0.0, "data": None}
 _STATIONS_TTL_SEC    = 60 * 60   # 1h — el catálogo de estaciones rara vez cambia
-_PREDICTIONS_TTL_SEC = 10 * 60   # 10 min — coincide con el polling del frontend
+_PREDICTIONS_TTL_SEC = 6 * 60 * 60  # 6 h — el frontend polling también es cada 6h
 
 
 async def _fetch_honduras_locations(limit: int = 100) -> list[dict]:
