@@ -21,9 +21,8 @@ _DIFF_COLS = ["pm25", "pm1"]   # rate of change 1h
 # El token-bucket garantiza que no hagamos más de N req/seg sin importar cuántas
 # corutinas estén corriendo en paralelo.
 #
-# 4 req/seg es conservador para el plan con API-key de OpenAQ (60 req/min = 1/seg
-# sin key, ≥10/seg con key). Ajustar OPENAQ_RATE_PER_SEC si tienes plan superior.
-_OPENAQ_RATE_PER_SEC: float = 2  # 2 req/s — con API key OpenAQ free tier aguanta ~120 req/min
+# Ajustar si OpenAQ sube el límite de la API key.
+_OPENAQ_RATE_PER_SEC: float = 1  # 1 req/s — conservador, respeta políticas free tier
 
 
 class _TokenBucket:

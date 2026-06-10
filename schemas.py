@@ -1,11 +1,24 @@
 import math
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 from datetime import datetime, timezone
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# Defaults para sanear valores no finitos (NaN/inf/None) que OpenAQ devuelve
+# cuando una estación no tiene lectura para un sensor. Las constraints ge=0
+# rechazan NaN (nan >= 0 → False) antes de que el SimpleImputer del ONNX
+# pueda rellenar con la mediana de entrenamiento, así que lo saneamos aquí.
+_SENSOR_DEFAULTS = {
+    "pm25": 0.0,
+    "pm1": 0.0,
+    "temperature": 25.0,
+    "relativehumidity": 60.0,
+    "um003": 0.0,
+}
 
 # Orden exacto de ALL_FEATURES del notebook v3.1.0 (35 features):
 # SENSOR_FEATURES (6) + TIME_FEATURES (5) + CYCLIC_FEATURES (6)
@@ -31,6 +44,18 @@ class SensorInput(BaseModel):
     month: int = Field(default_factory=lambda: _now().month, ge=1, le=12)
     is_weekend: int = Field(default_factory=lambda: int(_now().weekday() >= 5), ge=0, le=1)
     is_rush_hour: int = Field(default_factory=lambda: int(_now().hour in [7, 8, 9, 17, 18, 19]), ge=0, le=1)
+
+    @field_validator("pm25", "pm1", "temperature", "relativehumidity", "um003", mode="before")
+    @classmethod
+    def _sanitize_non_finite(cls, v, info):
+        # NaN/inf/None (estación sin datos) → default del campo, antes de las
+        # constraints ge=0/le=100 que de otro modo lanzarían ValidationError.
+        try:
+            if v is None or not math.isfinite(float(v)):
+                return _SENSOR_DEFAULTS.get(info.field_name, 0.0)
+        except (TypeError, ValueError):
+            return _SENSOR_DEFAULTS.get(info.field_name, 0.0)
+        return v
 
     @property
     def pm_ratio(self) -> float:
