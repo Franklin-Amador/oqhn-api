@@ -57,6 +57,26 @@ class SensorInput(BaseModel):
             return _SENSOR_DEFAULTS.get(info.field_name, 0.0)
         return v
 
+    @classmethod
+    def from_readings(cls, readings: dict, now: datetime) -> "SensorInput":
+        """
+        Construye un SensorInput desde el dict de lecturas de OpenAQ + timestamp.
+        Reusado por la API (/predict/live) y por el script precompute_predictions.py.
+        Los NaN de sensores faltantes los sanea el field_validator de arriba.
+        """
+        return cls(
+            pm25=             readings.get("pm25", 0.0),
+            pm1=              readings.get("pm1",  0.0),
+            temperature=      readings.get("temperature", 25.0),
+            relativehumidity= readings.get("relativehumidity", 60.0),
+            um003=            readings.get("um003", 0.0),
+            hour_of_day= now.hour,
+            day_of_week= now.weekday(),
+            month=       now.month,
+            is_weekend=  int(now.weekday() >= 5),
+            is_rush_hour=int(now.hour in [7, 8, 9, 17, 18, 19]),
+        )
+
     @property
     def pm_ratio(self) -> float:
         # pm25/pm1: proporcion particulas finas vs muy finas (pm10 no disponible en Honduras)

@@ -1,7 +1,9 @@
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -14,10 +16,36 @@ from schemas import (
     PredictionResult,
     SensorInput,
 )
-from stations import get_all_predictions, get_stations_geojson
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Micro-caché en memoria de los JSON precalculados en Blob. El precompute corre
+# cada 6h, así que un TTL corto evita pegarle a Blob en cada request sin servir
+# datos rancios. (url -> (timestamp, payload))
+_BLOB_CACHE: dict = {}
+_BLOB_CACHE_TTL = 300  # 5 min
+
+
+async def _fetch_blob_json(url: str):
+    """Lee un JSON desde Vercel Blob con micro-caché y fallback al último bueno.
+    Devuelve None si nunca se ha podido leer (404 = el precompute aún no corrió)."""
+    now = time.time()
+    hit = _BLOB_CACHE.get(url)
+    if hit and (now - hit[0]) < _BLOB_CACHE_TTL:
+        return hit[1]
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(url)
+            if resp.status_code == 404:
+                return hit[1] if hit else None
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        logger.warning("No se pudo leer Blob %s: %s", url, e)
+        return hit[1] if hit else None  # sirve el último bueno si existe
+    _BLOB_CACHE[url] = (now, data)
+    return data
 
 
 @asynccontextmanager
@@ -142,45 +170,29 @@ async def predict_live(location_id: int):
 # ─── Estaciones (catálogo + predicciones agregadas) ─────────────────────────
 
 @app.get("/stations", tags=["Stations"])
-async def stations_geojson(refresh: bool = False):
+async def stations_geojson():
     """
-    GeoJSON FeatureCollection con todas las estaciones de Honduras que tienen
-    coordenadas. Cacheado en memoria 1h. `?refresh=true` fuerza refetch.
+    GeoJSON FeatureCollection con las estaciones de Honduras.
+    Servido desde Vercel Blob (lo genera el job precompute cada 6h) — la API
+    no toca OpenAQ en el request path, así no hay timeouts ni riesgo de ban.
     """
-    try:
-        return await get_stations_geojson(force_refresh=refresh)
-    except Exception as e:
-        logger.error("Error fetching stations: %s", e)
-        raise HTTPException(502, f"OpenAQ falló: {e}")
-
-
-def _build_sensor_input(readings: dict, now) -> SensorInput:
-    return SensorInput(
-        pm25=             readings.get("pm25", 0.0),
-        pm1=              readings.get("pm1",  0.0),
-        temperature=      readings.get("temperature", 25.0),
-        relativehumidity= readings.get("relativehumidity", 60.0),
-        um003=            readings.get("um003", 0.0),
-        hour_of_day= now.hour,
-        day_of_week= now.weekday(),
-        month=       now.month,
-        is_weekend=  int(now.weekday() >= 5),
-        is_rush_hour=int(now.hour in [7, 8, 9, 17, 18, 19]),
-    )
+    data = await _fetch_blob_json(settings.stations_url)
+    if data is None:
+        raise HTTPException(503, "Catálogo aún no generado. El job precompute corre cada 6h.")
+    return data
 
 
 @app.get("/stations/predictions", tags=["Stations"])
-async def stations_predictions(refresh: bool = False):
+async def stations_predictions():
     """
-    Predicciones live para todas las estaciones HN. Cacheado 6h.
-    Primer hit (cache miss): ~4 min. Siguientes hits: instantáneos.
-    `?refresh=true` fuerza refetch.
+    Predicciones para todas las estaciones HN, precalculadas por el job
+    precompute (GitHub Action cada 6h) y servidas desde Vercel Blob.
+    Instantáneo: la API solo lee el JSON, no corre el batch ni llama a OpenAQ.
     """
-    await model_session.load()
-    if not model_session.is_loaded:
-        raise HTTPException(503, "Modelo aún cargando")
-    return await get_all_predictions(model_session, _build_sensor_input,
-                                     force_refresh=refresh)
+    data = await _fetch_blob_json(settings.predictions_url)
+    if data is None:
+        raise HTTPException(503, "Predicciones aún no generadas. El job precompute corre cada 6h.")
+    return data
 
 
 # ─── Predicción batch ─────────────────────────────────────────────────────────

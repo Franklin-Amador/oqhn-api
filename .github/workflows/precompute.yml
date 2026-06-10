@@ -1,0 +1,38 @@
+name: Precompute predicciones → Vercel Blob
+
+on:
+  # Cada 6h — alineado con el polling del frontend.
+  schedule:
+    - cron: "0 */6 * * *"
+
+  # Disparo manual desde la pestaña Actions.
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  precompute:
+    name: Batch predicciones → Blob
+    runs-on: ubuntu-latest
+    environment: OQHN
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run precompute
+        env:
+          OPENAQ_API_KEY:        ${{ secrets.OPENAQ_API_KEY }}
+          BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
+        run: python -u precompute_predictions.py
